@@ -1,0 +1,97 @@
+name: Sync release from ZUX-ZTool
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: qwqawa64/ZUX-ZTool
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch latest upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          json="$(gh api "repos/${UPSTREAM}/releases/latest")"
+          tag="$(jq -r .tag_name <<<"$json")"
+          body="$(jq -r .body <<<"$json")"
+          assets="$(jq -r '[.assets[].browser_download_url] | join("\n")' <<<"$json")"
+          if [ -z "$assets" ]; then
+            echo "Upstream release ${tag} has no assets, aborting" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "assets<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$assets" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          {
+            echo 'body<<BODY_EOF'
+            echo "$body"
+            echo 'BODY_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Skip if already released
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          apk_url="$(head -1 <<<"${{ steps.upstream.outputs.assets }}")"
+          echo "apk_url=${apk_url}" >> "$GITHUB_OUTPUT"
+          if gh release view "${{ steps.upstream.outputs.tag }}" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag already exists, nothing to do"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download upstream APK and read version
+        id: version
+        if: steps.check.outputs.exists == 'false'
+        env:
+          APK_URL: ${{ steps.check.outputs.apk_url }}
+        run: |
+          curl -sL -o app.apk "$APK_URL"
+          aapt="$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -1)"
+          badging="$("$aapt" dump badging app.apk)"
+          version_name="$(sed -n "s/.*versionName='\([^']*\)'.*/\1/p" <<<"$badging" | head -1)"
+          version_code="$(sed -n "s/.*versionCode='\([^']*\)'.*/\1/p" <<<"$badging" | head -1)"
+          echo "version_name=${version_name}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${version_code}" >> "$GITHUB_OUTPUT"
+          if [ -z "$version_name" ] || [ -z "$version_code" ]; then
+            echo "Failed to read version from APK" >&2
+            exit 1
+          fi
+
+      - name: Create draft release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+          BODY: ${{ steps.upstream.outputs.body }}
+          VERSION_NAME: ${{ steps.version.outputs.version_name }}
+          VERSION_CODE: ${{ steps.version.outputs.version_code }}
+        run: |
+          # tag: {versionCode}-{versionName}, e.g. 1907-Beta/261001
+          rel_tag="${VERSION_CODE}-${VERSION_NAME}"
+          date_part="${VERSION_NAME#*/}"           # 261001
+          rel_name="ZTool_Beta_${date_part}_c${VERSION_CODE}"
+          files=()
+          for url in "${{ steps.upstream.outputs.assets }}"; do
+            f="$(basename "$url")"
+            curl -sL -o "$f" "$url"
+            files+=("$f")
+          done
+          gh release create "$rel_tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$rel_name" \
+            --notes "$BODY" \
+            --draft \
+            "${files[@]}"
+          echo "Created draft release $rel_tag ($rel_name)"
